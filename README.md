@@ -24,12 +24,6 @@ application code. The implementation keeps MPS site tensors resident on the
 GPU while it executes supported gates, analytic expectation values, and direct
 sampling.
 
-This contribution does not include the project-specific backends and sampling
-strategies developed in earlier application prototypes. In particular, it does
-not add MQPU or multi-GPU targets, shared diagonal sampling, Hamiltonian
-grouping, or protein-folding-specific code. Those designs are outside the scope
-of this proposal.
-
 ## Implementation
 
 The new `AcceleratedMPSEngine` stores each MPS site as a double-complex CUDA
