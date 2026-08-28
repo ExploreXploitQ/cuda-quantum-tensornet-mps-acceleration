@@ -8,16 +8,98 @@
 
 #pragma once
 
+#include "accelerated_mps_engine.h"
 #include "mps_simulation_state.h"
 #include "simulator_cutensornet.h"
 #include <charconv>
 #include <errno.h>
+#include <limits>
+#include <type_traits>
 
 namespace nvqir {
 template <typename ScalarType = double>
 class SimulatorMPS : public SimulatorTensorNetBase<ScalarType> {
   MPSSettings m_settings;
   std::vector<MPSTensor> m_mpsTensors_d;
+  std::unique_ptr<AcceleratedMPSEngine> m_acceleratedMps;
+  std::size_t m_pendingZeroQubits = 0;
+
+#ifdef CUDAQ_MPS_HAS_CUSOLVER
+  static constexpr bool accelerationAvailable =
+      std::is_same_v<ScalarType, double>;
+#else
+  static constexpr bool accelerationAvailable = false;
+#endif
+
+  bool accelerationConfigurationSupported() const {
+    constexpr double minimumStableCutoff = 1.5e-8;
+    return !m_settings.gaugeOption.has_value() &&
+           m_settings.svdAlgo == CUTENSORNET_TENSOR_SVD_ALGO_GESVDJ &&
+           std::max(m_settings.absCutoff, m_settings.relCutoff) >=
+               minimumStableCutoff;
+  }
+
+  void initializePendingState(bool allowAcceleration) {
+    if (m_pendingZeroQubits == 0)
+      return;
+
+    if constexpr (accelerationAvailable) {
+      if (allowAcceleration && m_pendingZeroQubits > 1 &&
+          accelerationConfigurationSupported()) {
+        m_acceleratedMps = std::make_unique<AcceleratedMPSEngine>(
+            m_pendingZeroQubits, m_settings.maxBond, m_settings.absCutoff,
+            m_settings.relCutoff, static_cast<int>(m_settings.svdAlgo), 0);
+        CUDAQ_INFO("[SimulatorMPS] enabled device-resident MPS execution for "
+                   "{} qubits.",
+                   m_pendingZeroQubits);
+        m_pendingZeroQubits = 0;
+        return;
+      }
+    }
+
+    m_state = std::make_unique<TensorNetState<ScalarType>>(
+        m_pendingZeroQubits, scratchPad, m_cutnHandle, m_randomEngine);
+    m_pendingZeroQubits = 0;
+  }
+
+  void materializeAcceleratedState() {
+    initializePendingState(false);
+    if (!m_acceleratedMps)
+      return;
+
+    auto exported = m_acceleratedMps->exportNativeTensors();
+    try {
+      std::vector<MPSTensor> tensors;
+      tensors.reserve(exported.size());
+      for (auto &tensor : exported)
+        tensors.emplace_back(tensor.data, std::move(tensor.extents));
+
+      m_state = TensorNetState<ScalarType>::createFromMpsTensors(
+          tensors, scratchPad, m_cutnHandle, m_randomEngine);
+      m_state->m_tempDevicePtrs.reserve(tensors.size());
+      for (auto &tensor : tensors)
+        m_state->m_tempDevicePtrs.emplace_back(
+            tensor.deviceData,
+            typename TensorNetState<ScalarType>::TempDevicePtrDeleter{});
+    } catch (...) {
+      m_state.reset();
+      for (auto &tensor : exported)
+        cudaFree(tensor.data);
+      throw;
+    }
+    m_acceleratedMps.reset();
+  }
+
+  bool canAccelerate(const typename nvqir::CircuitSimulatorBase<
+                     ScalarType>::GateApplicationTask &task) const {
+    if (!m_acceleratedMps)
+      return false;
+    if (task.controls.empty())
+      return (task.targets.size() == 1 && task.matrix.size() == 4) ||
+             (task.targets.size() == 2 && task.matrix.size() == 16);
+    return task.controls.size() == 1 && task.targets.size() == 1 &&
+           task.matrix.size() == 4;
+  }
 
 public:
   using GateApplicationTask =
@@ -30,8 +112,77 @@ public:
   using SimulatorTensorNetBase<ScalarType>::m_randomEngine;
   SimulatorMPS() : SimulatorTensorNetBase<ScalarType>() {}
 
+  void applyGate(const GateApplicationTask &task) override {
+    initializePendingState(true);
+    if (canAccelerate(task)) {
+      if (task.controls.empty() && task.targets.size() == 1) {
+        std::vector<std::complex<double>> matrix(task.matrix.begin(),
+                                                 task.matrix.end());
+        m_acceleratedMps->applyOneQubit(matrix, task.targets.front());
+        return;
+      }
+
+      if (task.controls.empty()) {
+        std::vector<std::complex<double>> matrix(task.matrix.begin(),
+                                                 task.matrix.end());
+        m_acceleratedMps->applyTwoQubit(matrix, task.targets[0],
+                                        task.targets[1]);
+        return;
+      }
+
+      std::vector<std::complex<double>> targetMatrix(task.matrix.begin(),
+                                                     task.matrix.end());
+      auto controlledMatrix = generateFullGateTensor(1, targetMatrix);
+      m_acceleratedMps->applyTwoQubit(controlledMatrix, task.controls.front(),
+                                      task.targets.front());
+      return;
+    }
+
+    materializeAcceleratedState();
+    SimulatorTensorNetBase<ScalarType>::applyGate(task);
+  }
+
+  void applyNoiseChannel(const std::string_view gateName,
+                         const std::vector<std::size_t> &controls,
+                         const std::vector<std::size_t> &targets,
+                         const std::vector<double> &params) override {
+    materializeAcceleratedState();
+    SimulatorTensorNetBase<ScalarType>::applyNoiseChannel(gateName, controls,
+                                                          targets, params);
+  }
+
+  void applyNoise(const cudaq::kraus_channel &channel,
+                  const std::vector<std::size_t> &targets) override {
+    materializeAcceleratedState();
+    SimulatorTensorNetBase<ScalarType>::applyNoise(channel, targets);
+  }
+
+  bool measureQubit(const std::size_t qubitIdx) override {
+    materializeAcceleratedState();
+    return SimulatorTensorNetBase<ScalarType>::measureQubit(qubitIdx);
+  }
+
+  void resetQubit(const std::size_t qubitIdx) override {
+    materializeAcceleratedState();
+    SimulatorTensorNetBase<ScalarType>::resetQubit(qubitIdx);
+  }
+
+  void synchronize() override {
+    if (m_acceleratedMps)
+      m_acceleratedMps->synchronize();
+    else
+      SimulatorTensorNetBase<ScalarType>::synchronize();
+  }
+
+  void setRandomSeed(std::size_t randomSeed) override {
+    SimulatorTensorNetBase<ScalarType>::setRandomSeed(randomSeed);
+    if (m_acceleratedMps)
+      m_acceleratedMps->setRandomSeed(randomSeed);
+  }
+
   virtual void prepareQubitTensorState() override {
     LOG_API_TIME();
+    materializeAcceleratedState();
     // Clean up previously factorized MPS tensors
     for (auto &tensor : m_mpsTensors_d) {
       HANDLE_CUDA_ERROR(cudaFree(tensor.deviceData));
@@ -51,6 +202,7 @@ public:
   virtual void
   addQubitsToState(const cudaq::SimulationState &in_state) override {
     LOG_API_TIME();
+    materializeAcceleratedState();
     const MPSSimulationState<ScalarType> *const casted =
         dynamic_cast<const MPSSimulationState<ScalarType> *>(&in_state);
     if (!casted)
@@ -196,6 +348,7 @@ public:
       return;
     }
     // Let the base class to handle this Pauli rotation
+    materializeAcceleratedState();
     SimulatorTensorNetBase<ScalarType>::applyExpPauli(theta, controls, qubitIds,
                                                       op);
   }
@@ -238,9 +391,43 @@ public:
   cudaq::ExecutionResult sample(const std::vector<std::size_t> &measuredBits,
                                 const int shots,
                                 bool includeSequentialData = true) override {
+    initializePendingState(true);
     auto executionContext = cudaq::getExecutionContext();
 
     const bool hasNoise = this->getNoiseModel() != nullptr;
+    if (m_acceleratedMps && !hasNoise) {
+      if (shots < 1) {
+        const std::string allZ(m_acceleratedMps->numQubits(), 'Z');
+        return cudaq::ExecutionResult(
+            {}, m_acceleratedMps->expectation(allZ).real());
+      }
+
+      auto bitStrings = m_acceleratedMps->sample(
+          static_cast<std::size_t>(shots), m_randomEngine());
+      cudaq::ExecutionResult counts;
+      for (const auto &fullBitString : bitStrings) {
+        std::string measured;
+        measured.reserve(measuredBits.size());
+        for (const auto qubit : measuredBits)
+          measured.push_back(fullBitString.at(qubit));
+        if (includeSequentialData)
+          counts.appendResult(measured, 1);
+        else
+          counts.counts[measured]++;
+      }
+
+      double expectationValue = 0.0;
+      for (const auto &[bitString, count] : counts.counts) {
+        const double probability =
+            static_cast<double>(count) / static_cast<double>(shots);
+        expectationValue += cudaq::sample_result::has_even_parity(bitString)
+                                ? probability
+                                : -probability;
+      }
+      counts.expectationValue = expectationValue;
+      return counts;
+    }
+
     if (!hasNoise || shots < 1)
       return SimulatorTensorNetBase<ScalarType>::sample(measuredBits, shots,
                                                         includeSequentialData);
@@ -313,11 +500,48 @@ public:
   }
 
   cudaq::observe_result observe(const cudaq::spin_op &ham) override {
+    initializePendingState(true);
     assert(cudaq::spin_op::canonicalize(ham) == ham);
     auto executionContext = cudaq::getExecutionContext();
 
     LOG_API_TIME();
     const bool hasNoise = this->getNoiseModel() != nullptr;
+    const bool finiteShots =
+        executionContext && executionContext->shots > 0 &&
+        executionContext->shots != std::numeric_limits<std::size_t>::max();
+    if (m_acceleratedMps && !hasNoise && !finiteShots) {
+      if (ham.num_terms() == 0) {
+        std::vector<cudaq::ExecutionResult> emptyResults;
+        cudaq::sample_result emptyData(0.0, emptyResults);
+        return cudaq::observe_result(0.0, ham, emptyData);
+      }
+
+      std::complex<double> total = 0.0;
+      std::vector<cudaq::ExecutionResult> termResults;
+      termResults.reserve(ham.num_terms());
+      for (const auto &term : ham) {
+        const auto pauliWord =
+            term.get_pauli_word(m_acceleratedMps->numQubits());
+        const auto termValue = term.evaluate_coefficient() *
+                               m_acceleratedMps->expectation(pauliWord);
+        total += termValue;
+        termResults.emplace_back(
+            cudaq::ExecutionResult({}, term.get_term_id(), termValue.real()));
+      }
+
+      if (!cudaq::getEnvBool("CUDAQ_TENSORNET_OBSERVE_CONTRACT_PATH_REUSE",
+                             false)) {
+        return cudaq::observe_result(
+            total.real(), ham,
+            cudaq::sample_result(
+                cudaq::ExecutionResult({}, ham.to_string(), total.real())));
+      }
+
+      cudaq::sample_result perTermData(total.real(), termResults);
+      return cudaq::observe_result(total.real(), ham, perTermData);
+    }
+
+    materializeAcceleratedState();
     // If no noise, just use base class implementation.
     if (!hasNoise)
       return SimulatorTensorNetBase<ScalarType>::observe(ham);
@@ -369,7 +593,34 @@ public:
     return simulator.get();
   }
 
+  void deallocateStateImpl() override {
+    m_acceleratedMps.reset();
+    m_pendingZeroQubits = 0;
+    SimulatorTensorNetBase<ScalarType>::deallocateStateImpl();
+  }
+
+  void setToZeroState() override {
+    if (m_pendingZeroQubits > 0)
+      return;
+    if (m_acceleratedMps) {
+      m_acceleratedMps->resetZero();
+      return;
+    }
+    SimulatorTensorNetBase<ScalarType>::setToZeroState();
+  }
+
   void addQubitsToState(std::size_t numQubits, const void *ptr) override {
+    if constexpr (accelerationAvailable) {
+      if (!ptr && !m_state && accelerationConfigurationSupported()) {
+        if (m_acceleratedMps)
+          m_acceleratedMps->appendZeroQubits(numQubits);
+        else
+          m_pendingZeroQubits += numQubits;
+        return;
+      }
+    }
+
+    materializeAcceleratedState();
     LOG_API_TIME();
     if (!m_state) {
       if (!ptr) {
@@ -435,6 +686,7 @@ public:
 
   std::unique_ptr<cudaq::SimulationState> getSimulationState() override {
     LOG_API_TIME();
+    materializeAcceleratedState();
 
     if (!m_state || m_state->getNumQubits() == 0)
       return std::make_unique<MPSSimulationState<ScalarType>>(

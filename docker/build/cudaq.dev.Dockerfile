@@ -24,6 +24,18 @@ ARG base_image=ghcr.io/nvidia/cuda-quantum-devcontainer:cu12.6-gcc12-main
 FROM scratch AS ccache-data
 FROM $base_image AS devbuild
 
+# The published development image may predate the device-resident MPS backend
+# and contain the cuSOLVER runtime without its development headers. Keep a
+# freshly cloned repository build self-contained while newer base images roll
+# out. This is a no-op once libcusolver-dev is part of the base image.
+RUN if [ ! -f "${CUDA_INSTALL_PREFIX}/include/cusolverDn.h" ]; then \
+        cuda_version_suffix=$(echo "${CUDA_VERSION}" | tr . -) && \
+        apt-get update && \
+        apt-get install -y --no-install-recommends \
+          "libcusolver-dev-${cuda_version_suffix}" && \
+        apt-get clean && rm -rf /var/lib/apt/lists/*; \
+    fi
+
 ENV CUDAQ_REPO_ROOT=/workspaces/cuda-quantum
 ENV CUDAQ_INSTALL_PREFIX=/usr/local/cudaq
 ENV PATH="$CUDAQ_INSTALL_PREFIX/bin:${PATH}"

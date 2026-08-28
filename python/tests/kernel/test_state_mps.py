@@ -134,6 +134,78 @@ def test_state_from_mps_tensors():
 
 
 @skipIfNoGPU
+def test_mps_nonlocal_gate_standard_api_compatibility():
+
+    @cudaq.kernel
+    def circuit():
+        qubits = cudaq.qvector(5)
+        h(qubits[0])
+        ry(0.37, qubits[3])
+        x.ctrl(qubits[0], qubits[1])
+        rz(-0.22, qubits[4])
+        x.ctrl(qubits[3], qubits[4])
+        rx(0.51, qubits[2])
+        x.ctrl(qubits[1], qubits[3])
+
+    hamiltonian = (0.7 * cudaq.spin.z(0) - 0.2 * cudaq.spin.x(2) +
+                   0.4 * cudaq.spin.x(1) * cudaq.spin.y(3))
+
+    cudaq.set_target("qpp-cpu")
+    reference_state = np.array(cudaq.get_state(circuit))
+    reference_energy = cudaq.observe(circuit, hamiltonian).expectation()
+
+    cudaq.set_target("tensornet-mps")
+    mps_state = cudaq.get_state(circuit)
+    mps_state_vector = np.array(
+        [mps_state[index] for index in range(reference_state.size)])
+    mps_energy = cudaq.observe(circuit, hamiltonian).expectation()
+
+    assert np.allclose(mps_state_vector, reference_state, atol=1e-10)
+    assert np.isclose(mps_energy, reference_energy, atol=1e-10)
+
+
+@skipIfNoGPU
+def test_mps_fallback_from_device_resident_state():
+    cudaq.set_target("tensornet-mps")
+
+    @cudaq.kernel
+    def circuit(theta: float):
+        qubits = cudaq.qvector(4)
+        h(qubits[0])
+        x.ctrl(qubits[0], qubits[1])
+        exp_pauli(theta, qubits, "XYZI")
+        reset(qubits[3])
+
+    mps_energy = cudaq.observe(circuit, cudaq.spin.z(0), 0.23).expectation()
+
+    cudaq.set_target("qpp-cpu")
+    reference_energy = cudaq.observe(circuit, cudaq.spin.z(0),
+                                     0.23).expectation()
+    assert np.isclose(mps_energy, reference_energy, atol=1e-10)
+
+
+@skipIfNoGPU
+def test_mps_qubit_allocation_after_gate():
+
+    @cudaq.kernel
+    def circuit():
+        qubits = cudaq.qvector(2)
+        h(qubits[0])
+        x.ctrl(qubits[0], qubits[1])
+        appended = cudaq.qubit()
+        x(appended)
+        x.ctrl(qubits[0], appended)
+
+    cudaq.set_target("qpp-cpu")
+    reference = np.array(cudaq.get_state(circuit))
+
+    cudaq.set_target("tensornet-mps")
+    mps_state = cudaq.get_state(circuit)
+    actual = np.array([mps_state[index] for index in range(reference.size)])
+    assert np.allclose(actual, reference, atol=1e-10)
+
+
+@skipIfNoGPU
 def test_mps_observe_with_noise():
     """
     Test that MPS observe returns correct expectation values with noise model.
