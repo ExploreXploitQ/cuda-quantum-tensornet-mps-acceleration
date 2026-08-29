@@ -29,7 +29,7 @@ FROM $base_image AS devbuild
 # freshly cloned repository build self-contained while newer base images roll
 # out. This is a no-op once libcusolver-dev is part of the base image.
 RUN if [ ! -f "${CUDA_INSTALL_PREFIX}/include/cusolverDn.h" ]; then \
-        cuda_version_suffix=$(echo "${CUDA_VERSION}" | tr . -) && \
+        cuda_version_suffix=$(echo "${CUDA_VERSION}" | cut -d. -f1-2 | tr . -) && \
         apt-get update && \
         apt-get install -y --no-install-recommends \
           "libcusolver-dev-${cuda_version_suffix}" && \

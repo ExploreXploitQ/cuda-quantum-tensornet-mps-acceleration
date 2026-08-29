@@ -146,6 +146,7 @@ def test_mps_nonlocal_gate_standard_api_compatibility():
         x.ctrl(qubits[3], qubits[4])
         rx(0.51, qubits[2])
         x.ctrl(qubits[1], qubits[3])
+        x.ctrl(qubits[4], qubits[0])
 
     hamiltonian = (0.7 * cudaq.spin.z(0) - 0.2 * cudaq.spin.x(2) +
                    0.4 * cudaq.spin.x(1) * cudaq.spin.y(3))
@@ -160,27 +161,53 @@ def test_mps_nonlocal_gate_standard_api_compatibility():
         [mps_state[index] for index in range(reference_state.size)])
     mps_energy = cudaq.observe(circuit, hamiltonian).expectation()
 
-    assert np.allclose(mps_state_vector, reference_state, atol=1e-10)
+    # Preserve the public state indexing of the original tensornet-mps
+    # implementation. Its MPS state accessor uses the reverse-qubit-order
+    # representation documented by the existing State.from_data tests above.
+    num_qubits = 5
+    reversed_indices = np.array([
+        int(f"{index:0{num_qubits}b}"[::-1], 2)
+        for index in range(reference_state.size)
+    ])
+    assert np.allclose(mps_state_vector,
+                       reference_state[reversed_indices],
+                       atol=1e-10)
     assert np.isclose(mps_energy, reference_energy, atol=1e-10)
 
 
 @skipIfNoGPU
 def test_mps_fallback_from_device_resident_state():
-    cudaq.set_target("tensornet-mps")
 
     @cudaq.kernel
     def circuit(theta: float):
         qubits = cudaq.qvector(4)
-        h(qubits[0])
-        x.ctrl(qubits[0], qubits[1])
+        ry(0.17, qubits[0])
+        rx(-0.31, qubits[1])
+        ry(0.29, qubits[2])
+        rz(-0.41, qubits[3])
+        x.ctrl(qubits[0], qubits[3])
         exp_pauli(theta, qubits, "XYZI")
-        reset(qubits[3])
+        ry(-0.13, qubits[0])
+        x.ctrl(qubits[2], qubits[1])
 
-    mps_energy = cudaq.observe(circuit, cudaq.spin.z(0), 0.23).expectation()
+    hamiltonian = (0.37 * cudaq.spin.x(0) - 0.21 * cudaq.spin.z(1) +
+                   0.19 * cudaq.spin.y(2) * cudaq.spin.z(3))
 
     cudaq.set_target("qpp-cpu")
-    reference_energy = cudaq.observe(circuit, cudaq.spin.z(0),
-                                     0.23).expectation()
+    reference_state = np.array(cudaq.get_state(circuit, 0.23))
+    reference_energy = cudaq.observe(circuit, hamiltonian, 0.23).expectation()
+
+    cudaq.set_target("tensornet-mps")
+    mps_state = cudaq.get_state(circuit, 0.23)
+    actual_state = np.array(
+        [mps_state[index] for index in range(reference_state.size)])
+    mps_energy = cudaq.observe(circuit, hamiltonian, 0.23).expectation()
+
+    reversed_indices = np.array(
+        [int(f"{index:04b}"[::-1], 2) for index in range(reference_state.size)])
+    assert np.allclose(actual_state,
+                       reference_state[reversed_indices],
+                       atol=1e-10)
     assert np.isclose(mps_energy, reference_energy, atol=1e-10)
 
 
@@ -202,7 +229,62 @@ def test_mps_qubit_allocation_after_gate():
     cudaq.set_target("tensornet-mps")
     mps_state = cudaq.get_state(circuit)
     actual = np.array([mps_state[index] for index in range(reference.size)])
-    assert np.allclose(actual, reference, atol=1e-10)
+    reversed_indices = np.array(
+        [int(f"{index:03b}"[::-1], 2) for index in range(reference.size)])
+    assert np.allclose(actual, reference[reversed_indices], atol=1e-10)
+
+
+@skipIfNoGPU
+def test_mps_device_resident_sampling_qubit_order():
+
+    @cudaq.kernel
+    def circuit():
+        qubits = cudaq.qvector(4)
+        x(qubits[0])
+
+    cudaq.set_target("tensornet-mps")
+    counts = cudaq.sample(circuit, shots_count=32)
+    assert counts["1000"] == 32
+
+
+@skipIfNoGPU
+def test_mps_sampling_with_unmatched_noise_channel_falls_back():
+
+    @cudaq.kernel
+    def circuit():
+        qubits = cudaq.qvector(3)
+        x(qubits[0])
+
+    noise = cudaq.NoiseModel()
+    noise.add_all_qubit_channel("h", cudaq.BitFlipChannel(0.5))
+
+    cudaq.set_target("tensornet-mps")
+    counts = cudaq.sample(circuit, shots_count=32, noise_model=noise)
+    assert counts["100"] == 32
+
+
+@skipIfNoGPU
+def test_mps_reset_after_device_resident_evolution():
+
+    @cudaq.kernel
+    def circuit():
+        qubits = cudaq.qvector(4)
+        x(qubits[0])
+        ry(0.37, qubits[1])
+        x.ctrl(qubits[1], qubits[3])
+        x(qubits[2])
+        reset(qubits[2])
+        x.ctrl(qubits[3], qubits[0])
+
+    cudaq.set_target("qpp-cpu")
+    reference = np.array(cudaq.get_state(circuit))
+
+    cudaq.set_target("tensornet-mps")
+    mps_state = cudaq.get_state(circuit)
+    actual = np.array([mps_state[index] for index in range(reference.size)])
+    reversed_indices = np.array(
+        [int(f"{index:04b}"[::-1], 2) for index in range(reference.size)])
+    assert np.allclose(actual, reference[reversed_indices], atol=1e-10)
 
 
 @skipIfNoGPU

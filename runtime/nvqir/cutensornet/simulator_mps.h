@@ -32,11 +32,11 @@ class SimulatorMPS : public SimulatorTensorNetBase<ScalarType> {
 #endif
 
   bool accelerationConfigurationSupported() const {
-    constexpr double minimumStableCutoff = 1.5e-8;
     return !m_settings.gaugeOption.has_value() &&
            m_settings.svdAlgo == CUTENSORNET_TENSOR_SVD_ALGO_GESVDJ &&
+           m_settings.maxBond <= AcceleratedMPSEngine::MaximumBond &&
            std::max(m_settings.absCutoff, m_settings.relCutoff) >=
-               minimumStableCutoff;
+               AcceleratedMPSEngine::MinimumStableCutoff;
   }
 
   void initializePendingState(bool allowAcceleration) {
@@ -48,7 +48,7 @@ class SimulatorMPS : public SimulatorTensorNetBase<ScalarType> {
           accelerationConfigurationSupported()) {
         m_acceleratedMps = std::make_unique<AcceleratedMPSEngine>(
             m_pendingZeroQubits, m_settings.maxBond, m_settings.absCutoff,
-            m_settings.relCutoff, static_cast<int>(m_settings.svdAlgo), 0);
+            m_settings.relCutoff, static_cast<int>(m_settings.svdAlgo));
         CUDAQ_INFO("[SimulatorMPS] enabled device-resident MPS execution for "
                    "{} qubits.",
                    m_pendingZeroQubits);
@@ -77,10 +77,15 @@ class SimulatorMPS : public SimulatorTensorNetBase<ScalarType> {
       m_state = TensorNetState<ScalarType>::createFromMpsTensors(
           tensors, scratchPad, m_cutnHandle, m_randomEngine);
       m_state->m_tempDevicePtrs.reserve(tensors.size());
-      for (auto &tensor : tensors)
+      for (std::size_t i = 0; i < tensors.size(); ++i) {
+        auto &tensor = tensors[i];
         m_state->m_tempDevicePtrs.emplace_back(
             tensor.deviceData,
             typename TensorNetState<ScalarType>::TempDevicePtrDeleter{});
+        // Ownership has moved to m_state. A later exception must only free
+        // tensors that have not yet been transferred.
+        exported[i].data = nullptr;
+      }
     } catch (...) {
       m_state.reset();
       for (auto &tensor : exported)
@@ -110,6 +115,7 @@ public:
   using SimulatorTensorNetBase<ScalarType>::m_state;
   using SimulatorTensorNetBase<ScalarType>::scratchPad;
   using SimulatorTensorNetBase<ScalarType>::m_randomEngine;
+  using SimulatorTensorNetBase<ScalarType>::m_reuseContractionPathObserve;
   SimulatorMPS() : SimulatorTensorNetBase<ScalarType>() {}
 
   void applyGate(const GateApplicationTask &task) override {
@@ -172,12 +178,6 @@ public:
       m_acceleratedMps->synchronize();
     else
       SimulatorTensorNetBase<ScalarType>::synchronize();
-  }
-
-  void setRandomSeed(std::size_t randomSeed) override {
-    SimulatorTensorNetBase<ScalarType>::setRandomSeed(randomSeed);
-    if (m_acceleratedMps)
-      m_acceleratedMps->setRandomSeed(randomSeed);
   }
 
   virtual void prepareQubitTensorState() override {
@@ -395,7 +395,9 @@ public:
     auto executionContext = cudaq::getExecutionContext();
 
     const bool hasNoise = this->getNoiseModel() != nullptr;
-    if (m_acceleratedMps && !hasNoise) {
+    if (m_acceleratedMps && !hasNoise &&
+        (shots < 1 || m_acceleratedMps->supportsSampling(shots))) {
+      LOG_API_TIME();
       if (shots < 1) {
         const std::string allZ(m_acceleratedMps->numQubits(), 'Z');
         return cudaq::ExecutionResult(
@@ -428,6 +430,9 @@ public:
       return counts;
     }
 
+    // Noise and any other non-accelerated sampling path require a native
+    // TensorNetState.
+    materializeAcceleratedState();
     if (!hasNoise || shots < 1)
       return SimulatorTensorNetBase<ScalarType>::sample(measuredBits, shots,
                                                         includeSequentialData);
@@ -529,8 +534,7 @@ public:
             cudaq::ExecutionResult({}, term.get_term_id(), termValue.real()));
       }
 
-      if (!cudaq::getEnvBool("CUDAQ_TENSORNET_OBSERVE_CONTRACT_PATH_REUSE",
-                             false)) {
+      if (!m_reuseContractionPathObserve) {
         return cudaq::observe_result(
             total.real(), ham,
             cudaq::sample_result(

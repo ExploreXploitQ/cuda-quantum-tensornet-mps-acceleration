@@ -22,14 +22,19 @@ namespace nvqir {
 /// target interfaces remain unchanged.
 class AcceleratedMPSEngine {
 public:
+  // Flattened kernel indices contain four times the product of two bond
+  // dimensions and must fit in a signed 32-bit integer.
+  static constexpr int64_t MaximumBond = 23170;
+  // The covariance factorization squares the matrix condition number.
+  static constexpr double MinimumStableCutoff = 1.5e-8;
+
   struct DeviceTensor {
     void *data = nullptr;
     std::vector<int64_t> extents;
   };
 
   AcceleratedMPSEngine(std::size_t numQubits, int64_t maxBond, double absCutoff,
-                       double relCutoff, int svdAlgorithm,
-                       std::size_t randomSeed);
+                       double relCutoff, int svdAlgorithm);
   ~AcceleratedMPSEngine();
 
   AcceleratedMPSEngine(const AcceleratedMPSEngine &) = delete;
@@ -41,7 +46,6 @@ public:
   void appendZeroQubits(std::size_t count);
   void resetZero();
   void synchronize();
-  void setRandomSeed(std::size_t seed);
 
   void applyOneQubit(const std::vector<std::complex<double>> &matrix,
                      std::size_t qubit);
@@ -49,6 +53,7 @@ public:
                      std::size_t firstQubit, std::size_t secondQubit);
 
   std::complex<double> expectation(const std::string &pauliWord);
+  bool supportsSampling(std::size_t shots) const;
   std::vector<std::string> sample(std::size_t shots, std::size_t seed);
 
   /// Return newly allocated tensors in the same Fortran-order layout and

@@ -19,8 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
-#include <new>
+#include <limits>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -35,15 +34,6 @@ constexpr int Threads = 256;
   std::ostringstream message;
   message << "CUDA failure in " << expression << " at " << file << ':' << line
           << ": " << cudaGetErrorString(status);
-  throw std::runtime_error(message.str());
-}
-
-[[noreturn]] void throwCutensornet(cutensornetStatus_t status,
-                                   const char *expression, const char *file,
-                                   int line) {
-  std::ostringstream message;
-  message << "cuTensorNet failure in " << expression << " at " << file << ':'
-          << line << ": " << cutensornetGetErrorString(status);
   throw std::runtime_error(message.str());
 }
 
@@ -70,13 +60,6 @@ constexpr int Threads = 256;
     const auto status = (expression);                                          \
     if (status != cudaSuccess)                                                 \
       throwCuda(status, #expression, __FILE__, __LINE__);                      \
-  } while (false)
-
-#define ACCEL_CUTN(expression)                                                 \
-  do {                                                                         \
-    const auto status = (expression);                                          \
-    if (status != CUTENSORNET_STATUS_SUCCESS)                                  \
-      throwCutensornet(status, #expression, __FILE__, __LINE__);               \
   } while (false)
 
 #ifdef CUDAQ_MPS_HAS_CUSOLVER
@@ -404,12 +387,12 @@ __global__ void exportTensorKernel(const DeviceComplex *source,
   if (numSites == 1)
     destinationIndex = physical;
   else if (nativeSite == 0)
-    destinationIndex = physical + static_cast<std::size_t>(2) * r;
+    destinationIndex = physical + static_cast<std::size_t>(2) * l;
   else if (nativeSite == numSites - 1)
-    destinationIndex = l + static_cast<std::size_t>(left) * physical;
+    destinationIndex = r + static_cast<std::size_t>(right) * physical;
   else
-    destinationIndex = l + static_cast<std::size_t>(left) *
-                               (physical + static_cast<std::size_t>(2) * r);
+    destinationIndex = r + static_cast<std::size_t>(right) *
+                               (physical + static_cast<std::size_t>(2) * l);
   destination[destinationIndex] = source[index];
 }
 
@@ -471,33 +454,41 @@ public:
     int right = 1;
   };
 
-  Impl(std::size_t numQubits, int64_t maxBond, double absCutoff,
-       double relCutoff, int svdAlgorithm, std::size_t seed)
-      : maxBond(static_cast<int>(maxBond)), absCutoff(absCutoff),
-        relCutoff(relCutoff), svdAlgorithm(svdAlgorithm), randomSeed(seed) {
+  Impl(std::size_t numQubits, int64_t requestedMaxBond, double absCutoff,
+       double relCutoff, int svdAlgorithm)
+      : absCutoff(absCutoff), relCutoff(relCutoff) {
     if (numQubits == 0)
       throw std::invalid_argument(
           "Accelerated MPS requires at least one qubit");
-    if (maxBond < 1)
-      throw std::invalid_argument("MPS maximum bond must be positive");
+    if (numQubits > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+      throw std::invalid_argument("Accelerated MPS qubit count is too large");
+    if (requestedMaxBond < 1 ||
+        requestedMaxBond > AcceleratedMPSEngine::MaximumBond)
+      throw std::invalid_argument(
+          "MPS maximum bond is outside the accelerated range");
+    if (svdAlgorithm != CUTENSORNET_TENSOR_SVD_ALGO_GESVDJ ||
+        std::max(absCutoff, relCutoff) <
+            AcceleratedMPSEngine::MinimumStableCutoff)
+      throw std::invalid_argument(
+          "MPS factorization configuration is not accelerated");
+    maxBond = static_cast<int>(requestedMaxBond);
+#ifndef CUDAQ_MPS_HAS_CUSOLVER
+    throw std::runtime_error(
+        "Accelerated MPS requires cuSOLVER development support");
+#else
     ACCEL_CUDA(cudaGetDevice(&device));
     ACCEL_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     try {
-#ifdef CUDAQ_MPS_HAS_CUSOLVER
-      if (usesCovarianceSvd()) {
-        ACCEL_CUBLAS(cublasCreate(&cublasHandle));
-        ACCEL_CUBLAS(cublasSetStream(cublasHandle, stream));
-        ACCEL_CUSOLVER(cusolverDnCreate(&cusolverHandle));
-        ACCEL_CUSOLVER(cusolverDnSetStream(cusolverHandle, stream));
-      }
-#endif
-      if (!usesCovarianceSvd())
-        ACCEL_CUTN(cutensornetCreate(&cutnHandle));
+      ACCEL_CUBLAS(cublasCreate(&cublasHandle));
+      ACCEL_CUBLAS(cublasSetStream(cublasHandle, stream));
+      ACCEL_CUSOLVER(cusolverDnCreate(&cusolverHandle));
+      ACCEL_CUSOLVER(cusolverDnSetStream(cusolverHandle, stream));
       appendZeroQubits(numQubits);
     } catch (...) {
       release();
       throw;
     }
+#endif
   }
 
   ~Impl() { release(); }
@@ -510,8 +501,6 @@ public:
       if (site.data)
         cudaFree(site.data);
     sites.clear();
-    if (cutnHandle)
-      cutensornetDestroy(cutnHandle);
 #ifdef CUDAQ_MPS_HAS_CUSOLVER
     if (cusolverHandle)
       cusolverDnDestroy(cusolverHandle);
@@ -520,7 +509,6 @@ public:
 #endif
     if (stream)
       cudaStreamDestroy(stream);
-    cutnHandle = nullptr;
 #ifdef CUDAQ_MPS_HAS_CUSOLVER
     cusolverHandle = nullptr;
     cublasHandle = nullptr;
@@ -530,15 +518,38 @@ public:
 
   void appendZeroQubits(std::size_t count) {
     ACCEL_CUDA(cudaSetDevice(device));
+    if (count > static_cast<std::size_t>(std::numeric_limits<int>::max()) -
+                    sites.size())
+      throw std::invalid_argument("Accelerated MPS qubit count is too large");
     const DeviceComplex zeroState[2]{One, Zero};
-    for (std::size_t index = 0; index < count; ++index) {
-      DeviceComplex *data = nullptr;
-      ACCEL_CUDA(cudaMalloc(&data, sizeof(zeroState)));
-      ACCEL_CUDA(cudaMemcpyAsync(data, zeroState, sizeof(zeroState),
-                                 cudaMemcpyHostToDevice, stream));
-      // CUDA-Q assigns appended qubits increasing indices, while the native
-      // cuTensorNet MPS tensor list is ordered from the highest qubit to q0.
-      sites.insert(sites.begin(), {data, 1, 1});
+    std::vector<Site> appended;
+    appended.reserve(count);
+    try {
+      for (std::size_t index = 0; index < count; ++index) {
+        DeviceComplex *data = nullptr;
+        ACCEL_CUDA(cudaMalloc(&data, sizeof(zeroState)));
+        try {
+          ACCEL_CUDA(cudaMemcpyAsync(data, zeroState, sizeof(zeroState),
+                                     cudaMemcpyHostToDevice, stream));
+        } catch (...) {
+          cudaFree(data);
+          throw;
+        }
+        appended.push_back({data, 1, 1});
+      }
+    } catch (...) {
+      for (auto &site : appended)
+        cudaFree(site.data);
+      throw;
+    }
+    try {
+      // CUDA-Q assigns appended qubits increasing indices, while the internal
+      // accelerated chain is ordered from the highest qubit to q0.
+      sites.insert(sites.begin(), appended.begin(), appended.end());
+    } catch (...) {
+      for (auto &site : appended)
+        cudaFree(site.data);
+      throw;
     }
   }
 
@@ -548,8 +559,14 @@ public:
     const DeviceComplex zeroState[2]{One, Zero};
     for (auto &site : sites) {
       if (site.left != 1 || site.right != 1) {
-        ACCEL_CUDA(cudaFree(site.data));
-        ACCEL_CUDA(cudaMalloc(&site.data, sizeof(zeroState)));
+        DeviceComplex *replacement = nullptr;
+        ACCEL_CUDA(cudaMalloc(&replacement, sizeof(zeroState)));
+        const auto status = cudaFree(site.data);
+        if (status != cudaSuccess) {
+          cudaFree(replacement);
+          throwCuda(status, "cudaFree(site.data)", __FILE__, __LINE__);
+        }
+        site.data = replacement;
       }
       ACCEL_CUDA(cudaMemcpyAsync(site.data, zeroState, sizeof(zeroState),
                                  cudaMemcpyHostToDevice, stream));
@@ -559,6 +576,7 @@ public:
 
   void applyOneQubit(const std::vector<std::complex<double>> &matrix,
                      std::size_t qubit) {
+    ACCEL_CUDA(cudaSetDevice(device));
     if (matrix.size() != 4 || qubit >= sites.size())
       throw std::invalid_argument("Invalid one-qubit MPS gate");
     const std::size_t siteIndex = sites.size() - 1 - qubit;
@@ -579,18 +597,6 @@ public:
     DeviceComplex *right = nullptr;
     int rank = 0;
   };
-
-  bool usesCovarianceSvd() const {
-#ifdef CUDAQ_MPS_HAS_CUSOLVER
-    // Forming a Gram matrix squares the condition number. Preserve the native
-    // cuTensorNet path when users request cutoffs below that stable range.
-    constexpr double minimumStableCutoff = 1.5e-8;
-    return svdAlgorithm == CUTENSORNET_TENSOR_SVD_ALGO_GESVDJ &&
-           std::max(absCutoff, relCutoff) >= minimumStableCutoff;
-#else
-    return false;
-#endif
-  }
 
 #ifdef CUDAQ_MPS_HAS_CUSOLVER
   SvdFactors factorizeCovariance(DeviceComplex *matrix, int rows, int columns) {
@@ -648,7 +654,7 @@ public:
           std::max(absCutoff * absCutoff, relCutoff * relCutoff * maximum);
       int rank = 0;
       for (auto iterator = hostEigenvalues.rbegin();
-           iterator != hostEigenvalues.rend() && *iterator > threshold;
+           iterator != hostEigenvalues.rend() && *iterator >= threshold;
            ++iterator)
         ++rank;
       rank = std::clamp(rank, 1, std::min(maxBond, dimension));
@@ -704,142 +710,16 @@ public:
   }
 #endif
 
-  SvdFactors factorizeCutensornet(DeviceComplex *matrix, int rows,
-                                  int columns) {
-    const int maximumRank = std::min({rows, columns, maxBond});
-    const int64_t inputExtents[2]{rows, columns};
-    int64_t leftExtents[2]{rows, maximumRank};
-    int64_t rightExtents[2]{maximumRank, columns};
-    const int32_t inputModes[2]{0, 1};
-    const int32_t leftModes[2]{0, 2};
-    const int32_t rightModes[2]{2, 1};
-
-    cutensornetTensorDescriptor_t inputDescriptor = nullptr;
-    cutensornetTensorDescriptor_t leftDescriptor = nullptr;
-    cutensornetTensorDescriptor_t rightDescriptor = nullptr;
-    cutensornetTensorSVDConfig_t configuration = nullptr;
-    cutensornetTensorSVDInfo_t information = nullptr;
-    cutensornetWorkspaceDescriptor_t workspaceDescriptor = nullptr;
-    void *deviceWorkspace = nullptr;
-    void *hostWorkspace = nullptr;
-    DeviceComplex *left = nullptr;
-    DeviceComplex *right = nullptr;
-    try {
-      ACCEL_CUTN(cutensornetCreateTensorDescriptor(
-          cutnHandle, 2, inputExtents, nullptr, inputModes, CUDA_C_64F,
-          &inputDescriptor));
-      ACCEL_CUTN(cutensornetCreateTensorDescriptor(
-          cutnHandle, 2, leftExtents, nullptr, leftModes, CUDA_C_64F,
-          &leftDescriptor));
-      ACCEL_CUTN(cutensornetCreateTensorDescriptor(
-          cutnHandle, 2, rightExtents, nullptr, rightModes, CUDA_C_64F,
-          &rightDescriptor));
-      ACCEL_CUTN(cutensornetCreateTensorSVDConfig(cutnHandle, &configuration));
-      ACCEL_CUTN(cutensornetCreateTensorSVDInfo(cutnHandle, &information));
-
-      const auto algorithm =
-          static_cast<cutensornetTensorSVDAlgo_t>(svdAlgorithm);
-      const auto partition = CUTENSORNET_TENSOR_SVD_PARTITION_SV;
-      ACCEL_CUTN(cutensornetTensorSVDConfigSetAttribute(
-          cutnHandle, configuration, CUTENSORNET_TENSOR_SVD_CONFIG_ALGO,
-          &algorithm, sizeof(algorithm)));
-      ACCEL_CUTN(cutensornetTensorSVDConfigSetAttribute(
-          cutnHandle, configuration, CUTENSORNET_TENSOR_SVD_CONFIG_ABS_CUTOFF,
-          &absCutoff, sizeof(absCutoff)));
-      ACCEL_CUTN(cutensornetTensorSVDConfigSetAttribute(
-          cutnHandle, configuration, CUTENSORNET_TENSOR_SVD_CONFIG_REL_CUTOFF,
-          &relCutoff, sizeof(relCutoff)));
-      ACCEL_CUTN(cutensornetTensorSVDConfigSetAttribute(
-          cutnHandle, configuration, CUTENSORNET_TENSOR_SVD_CONFIG_S_PARTITION,
-          &partition, sizeof(partition)));
-
-      ACCEL_CUTN(cutensornetCreateWorkspaceDescriptor(cutnHandle,
-                                                      &workspaceDescriptor));
-      ACCEL_CUTN(cutensornetWorkspaceComputeSVDSizes(
-          cutnHandle, inputDescriptor, leftDescriptor, rightDescriptor,
-          configuration, workspaceDescriptor));
-
-      int64_t deviceWorkspaceSize = 0;
-      ACCEL_CUTN(cutensornetWorkspaceGetMemorySize(
-          cutnHandle, workspaceDescriptor,
-          CUTENSORNET_WORKSIZE_PREF_RECOMMENDED, CUTENSORNET_MEMSPACE_DEVICE,
-          CUTENSORNET_WORKSPACE_SCRATCH, &deviceWorkspaceSize));
-      if (deviceWorkspaceSize > 0) {
-        ACCEL_CUDA(cudaMalloc(&deviceWorkspace, deviceWorkspaceSize));
-        ACCEL_CUTN(cutensornetWorkspaceSetMemory(
-            cutnHandle, workspaceDescriptor, CUTENSORNET_MEMSPACE_DEVICE,
-            CUTENSORNET_WORKSPACE_SCRATCH, deviceWorkspace,
-            deviceWorkspaceSize));
-      }
-
-      int64_t hostWorkspaceSize = 0;
-      ACCEL_CUTN(cutensornetWorkspaceGetMemorySize(
-          cutnHandle, workspaceDescriptor,
-          CUTENSORNET_WORKSIZE_PREF_RECOMMENDED, CUTENSORNET_MEMSPACE_HOST,
-          CUTENSORNET_WORKSPACE_SCRATCH, &hostWorkspaceSize));
-      if (hostWorkspaceSize > 0) {
-        hostWorkspace = std::malloc(hostWorkspaceSize);
-        if (!hostWorkspace)
-          throw std::bad_alloc();
-        ACCEL_CUTN(cutensornetWorkspaceSetMemory(
-            cutnHandle, workspaceDescriptor, CUTENSORNET_MEMSPACE_HOST,
-            CUTENSORNET_WORKSPACE_SCRATCH, hostWorkspace, hostWorkspaceSize));
-      }
-
-      ACCEL_CUDA(cudaMalloc(&left, sizeof(DeviceComplex) *
-                                       static_cast<std::size_t>(rows) *
-                                       maximumRank));
-      ACCEL_CUDA(cudaMalloc(&right, sizeof(DeviceComplex) *
-                                        static_cast<std::size_t>(maximumRank) *
-                                        columns));
-      ACCEL_CUTN(cutensornetTensorSVD(
-          cutnHandle, inputDescriptor, matrix, leftDescriptor, left, nullptr,
-          rightDescriptor, right, configuration, information,
-          workspaceDescriptor, stream));
-      ACCEL_CUDA(cudaStreamSynchronize(stream));
-
-      int64_t reducedRank = maximumRank;
-      ACCEL_CUTN(cutensornetTensorSVDInfoGetAttribute(
-          cutnHandle, information, CUTENSORNET_TENSOR_SVD_INFO_REDUCED_EXTENT,
-          &reducedRank, sizeof(reducedRank)));
-
-      cudaFree(deviceWorkspace);
-      std::free(hostWorkspace);
-      cutensornetDestroyWorkspaceDescriptor(workspaceDescriptor);
-      cutensornetDestroyTensorSVDInfo(information);
-      cutensornetDestroyTensorSVDConfig(configuration);
-      cutensornetDestroyTensorDescriptor(inputDescriptor);
-      cutensornetDestroyTensorDescriptor(leftDescriptor);
-      cutensornetDestroyTensorDescriptor(rightDescriptor);
-      const int rank = static_cast<int>(reducedRank);
-      return {left, right, rank};
-    } catch (...) {
-      cudaFree(left);
-      cudaFree(right);
-      cudaFree(deviceWorkspace);
-      std::free(hostWorkspace);
-      if (workspaceDescriptor)
-        cutensornetDestroyWorkspaceDescriptor(workspaceDescriptor);
-      if (information)
-        cutensornetDestroyTensorSVDInfo(information);
-      if (configuration)
-        cutensornetDestroyTensorSVDConfig(configuration);
-      if (inputDescriptor)
-        cutensornetDestroyTensorDescriptor(inputDescriptor);
-      if (leftDescriptor)
-        cutensornetDestroyTensorDescriptor(leftDescriptor);
-      if (rightDescriptor)
-        cutensornetDestroyTensorDescriptor(rightDescriptor);
-      throw;
-    }
-  }
-
   SvdFactors factorize(DeviceComplex *matrix, int rows, int columns) {
 #ifdef CUDAQ_MPS_HAS_CUSOLVER
-    if (usesCovarianceSvd())
-      return factorizeCovariance(matrix, rows, columns);
+    return factorizeCovariance(matrix, rows, columns);
+#else
+    (void)matrix;
+    (void)rows;
+    (void)columns;
+    throw std::runtime_error(
+        "Accelerated MPS requires cuSOLVER development support");
 #endif
-    return factorizeCutensornet(matrix, rows, columns);
   }
 
   void applyAdjacent(const std::vector<std::complex<double>> &matrix,
@@ -913,6 +793,7 @@ public:
 
   void applyTwoQubit(const std::vector<std::complex<double>> &matrix,
                      std::size_t firstQubit, std::size_t secondQubit) {
+    ACCEL_CUDA(cudaSetDevice(device));
     if (matrix.size() != 16 || firstQubit >= sites.size() ||
         secondQubit >= sites.size() || firstQubit == secondQubit)
       throw std::invalid_argument("Invalid two-qubit MPS gate");
@@ -932,6 +813,7 @@ public:
   }
 
   std::complex<double> expectation(const std::string &pauliWord) {
+    ACCEL_CUDA(cudaSetDevice(device));
     if (pauliWord.size() != sites.size())
       throw std::invalid_argument("Pauli word size does not match MPS state");
     DeviceComplex *environment = nullptr;
@@ -995,9 +877,23 @@ public:
     }
   }
 
+  bool supportsSampling(std::size_t shots) const {
+    constexpr std::size_t maximumWorkspaceElements = 8 * 1024 * 1024;
+    int maximumBond = 1;
+    for (const auto &site : sites)
+      maximumBond = std::max({maximumBond, site.left, site.right});
+    return shots <= maximumWorkspaceElements /
+                        (2 * static_cast<std::size_t>(maximumBond)) &&
+           shots <= maximumWorkspaceElements / sites.size();
+  }
+
   std::vector<std::string> sample(std::size_t shots, std::size_t seed) {
+    ACCEL_CUDA(cudaSetDevice(device));
     if (shots == 0)
       return {};
+    if (!supportsSampling(shots))
+      throw std::invalid_argument(
+          "Shot count exceeds the accelerated MPS sampling workspace");
     std::vector<DeviceComplex *> rightEnvironments(sites.size() + 1, nullptr);
     DeviceComplex *temporary = nullptr;
     DeviceComplex *vectorsA = nullptr;
@@ -1107,29 +1003,35 @@ public:
   }
 
   std::vector<AcceleratedMPSEngine::DeviceTensor> exportNativeTensors() {
+    ACCEL_CUDA(cudaSetDevice(device));
     std::vector<AcceleratedMPSEngine::DeviceTensor> output;
     output.reserve(sites.size());
     try {
-      for (std::size_t siteIndex = 0; siteIndex < sites.size(); ++siteIndex) {
-        const auto &site = sites[siteIndex];
+      for (std::size_t nativeSite = 0; nativeSite < sites.size();
+           ++nativeSite) {
+        // The accelerated chain runs from the highest logical qubit to q0.
+        // cutensornetStateInitializeMPS expects the native CUDA-Q tensor order,
+        // q0 through the highest logical qubit, with the adjacent bond axes
+        // reversed accordingly.
+        const auto &site = sites[sites.size() - 1 - nativeSite];
         const std::size_t elements =
             static_cast<std::size_t>(site.left) * 2 * site.right;
         std::vector<int64_t> extents;
         if (sites.size() == 1)
           extents = {2};
-        else if (siteIndex == 0)
-          extents = {2, site.right};
-        else if (siteIndex == sites.size() - 1)
-          extents = {site.left, 2};
+        else if (nativeSite == 0)
+          extents = {2, site.left};
+        else if (nativeSite == sites.size() - 1)
+          extents = {site.right, 2};
         else
-          extents = {site.left, 2, site.right};
+          extents = {site.right, 2, site.left};
         output.push_back({nullptr, std::move(extents)});
         ACCEL_CUDA(
             cudaMalloc(&output.back().data, sizeof(DeviceComplex) * elements));
         exportTensorKernel<<<(elements + Threads - 1) / Threads, Threads, 0,
                              stream>>>(
             site.data, static_cast<DeviceComplex *>(output.back().data),
-            site.left, site.right, static_cast<int>(siteIndex),
+            site.left, site.right, static_cast<int>(nativeSite),
             static_cast<int>(sites.size()));
         ACCEL_KERNEL();
       }
@@ -1146,23 +1048,19 @@ public:
   int maxBond = 64;
   double absCutoff = 1e-5;
   double relCutoff = 1e-5;
-  int svdAlgorithm = static_cast<int>(CUTENSORNET_TENSOR_SVD_ALGO_GESVDJ);
-  std::size_t randomSeed = 0;
   cudaStream_t stream = nullptr;
 #ifdef CUDAQ_MPS_HAS_CUSOLVER
   cublasHandle_t cublasHandle = nullptr;
   cusolverDnHandle_t cusolverHandle = nullptr;
 #endif
-  cutensornetHandle_t cutnHandle = nullptr;
   std::vector<Site> sites;
 };
 
 AcceleratedMPSEngine::AcceleratedMPSEngine(std::size_t numQubits,
                                            int64_t maxBond, double absCutoff,
-                                           double relCutoff, int svdAlgorithm,
-                                           std::size_t randomSeed)
+                                           double relCutoff, int svdAlgorithm)
     : impl(std::make_unique<Impl>(numQubits, maxBond, absCutoff, relCutoff,
-                                  svdAlgorithm, randomSeed)) {}
+                                  svdAlgorithm)) {}
 
 AcceleratedMPSEngine::~AcceleratedMPSEngine() = default;
 AcceleratedMPSEngine::AcceleratedMPSEngine(AcceleratedMPSEngine &&) noexcept =
@@ -1185,10 +1083,6 @@ void AcceleratedMPSEngine::synchronize() {
   ACCEL_CUDA(cudaStreamSynchronize(impl->stream));
 }
 
-void AcceleratedMPSEngine::setRandomSeed(std::size_t seed) {
-  impl->randomSeed = seed;
-}
-
 void AcceleratedMPSEngine::applyOneQubit(
     const std::vector<std::complex<double>> &matrix, std::size_t qubit) {
   impl->applyOneQubit(matrix, qubit);
@@ -1203,6 +1097,10 @@ void AcceleratedMPSEngine::applyTwoQubit(
 std::complex<double>
 AcceleratedMPSEngine::expectation(const std::string &pauliWord) {
   return impl->expectation(pauliWord);
+}
+
+bool AcceleratedMPSEngine::supportsSampling(std::size_t shots) const {
+  return impl->supportsSampling(shots);
 }
 
 std::vector<std::string> AcceleratedMPSEngine::sample(std::size_t shots,

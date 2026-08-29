@@ -30,20 +30,6 @@ if (${cuTensorNet_VERSION} VERSION_GREATER_EQUAL "2.12.1")
   find_path(
     CUDAQ_MPS_CUSOLVER_INCLUDE_DIR cusolverDn.h
     HINTS ${CUDAToolkit_INCLUDE_DIRS})
-  if(CUDAQ_MPS_CUSOLVER_INCLUDE_DIR)
-    if(TARGET CUDA::cusolver)
-      set(CUDAQ_MPS_CUSOLVER CUDA::cusolver)
-    else()
-      get_target_property(_cuda_cublas_location CUDA::cublas
-                          IMPORTED_LOCATION)
-      get_filename_component(_cuda_library_dir "${_cuda_cublas_location}"
-                             DIRECTORY)
-      find_file(CUDAQ_MPS_CUSOLVER_FILE
-                NAMES libcusolver.so libcusolver.so.11
-                HINTS "${_cuda_library_dir}")
-      set(CUDAQ_MPS_CUSOLVER "${CUDAQ_MPS_CUSOLVER_FILE}")
-    endif()
-  endif()
 
   # Helper macro to add cutensornet-based backends
   macro (nvqir_create_cutn_plugin LIBRARY_NAME CREATE_TARGET_CONFIG)
@@ -58,26 +44,24 @@ if (${cuTensorNet_VERSION} VERSION_GREATER_EQUAL "2.12.1")
     endif()
   endmacro()
 
-  nvqir_create_cutn_plugin(tensornet TRUE ${BASE_TENSOR_BACKEND_SRS}
-                           simulator_tensornet_fp64_register.cpp)
+  nvqir_create_cutn_plugin(tensornet TRUE ${BASE_TENSOR_BACKEND_SRS} simulator_tensornet_fp64_register.cpp)
   set(MPS_ACCELERATION_SOURCES accelerated_mps_engine.cu)
 
   nvqir_create_cutn_plugin(tensornet-mps TRUE ${BASE_TENSOR_BACKEND_SRS}
                            ${MPS_ACCELERATION_SOURCES}
                            simulator_mps_fp64_register.cpp)
-  nvqir_create_cutn_plugin(tensornet-fp32 FALSE ${BASE_TENSOR_BACKEND_SRS}
-                           simulator_tensornet_fp32_register.cpp)
+  nvqir_create_cutn_plugin(tensornet-fp32 FALSE ${BASE_TENSOR_BACKEND_SRS} simulator_tensornet_fp32_register.cpp)
   nvqir_create_cutn_plugin(tensornet-mps-fp32 FALSE
                            ${BASE_TENSOR_BACKEND_SRS}
                            ${MPS_ACCELERATION_SOURCES}
                            simulator_mps_fp32_register.cpp)
-  if(CUDAQ_MPS_CUSOLVER_INCLUDE_DIR AND CUDAQ_MPS_CUSOLVER)
+  if(CUDAQ_MPS_CUSOLVER_INCLUDE_DIR AND TARGET CUDA::cusolver)
     target_compile_definitions(nvqir-tensornet-mps
                                PRIVATE CUDAQ_MPS_HAS_CUSOLVER)
     target_include_directories(nvqir-tensornet-mps
                                PRIVATE ${CUDAQ_MPS_CUSOLVER_INCLUDE_DIR})
     target_link_libraries(nvqir-tensornet-mps
-                          PRIVATE CUDA::cublas ${CUDAQ_MPS_CUSOLVER})
+                          PRIVATE CUDA::cublas CUDA::cusolver)
   else()
     message(STATUS "cuSOLVER development files not found; tensornet-mps "
                    "will use the native cuTensorNet implementation.")
