@@ -1,6 +1,6 @@
 cff-version: 1.2.0
 title: 'CUDA-Q'
-message: 'If you use this software, please cite it as below.'
+message: 'Please cite CUDA-Q as below and the cuQuantum SDK reference when reporting tensor-network simulation results.'
 authors:
   - name: "The CUDA-Q development team"
 license: Apache-2.0
@@ -9,3 +9,58 @@ repository-code: "https://github.com/NVIDIA/cuda-quantum"
 type: software
 url: "https://github.com/NVIDIA/cuda-quantum"
 # doi: 
+
+references:
+  - type: conference-paper
+    title: 'cuQuantum SDK: A High-Performance Library for Accelerating Quantum Science'
+    authors:
+      - family-names: "Bayraktar"
+        given-names: "Harun"
+      - family-names: "Charara"
+        given-names: "Ali"
+      - family-names: "Clark"
+        given-names: "David"
+      - family-names: "Cohen"
+        given-names: "Saul"
+      - family-names: "Costa"
+        given-names: "Timothy"
+      - family-names: "Fang"
+        given-names: "Yao-Lung L."
+      - family-names: "Gao"
+        given-names: "Yang"
+      - family-names: "Guan"
+        given-names: "Jack"
+      - family-names: "Gunnels"
+        given-names: "John"
+      - family-names: "Haidar"
+        given-names: "Azzam"
+      - family-names: "Hehn"
+        given-names: "Andreas"
+      - family-names: "Hohnerbach"
+        given-names: "Markus"
+      - family-names: "Jones"
+        given-names: "Matthew"
+      - family-names: "Lubowe"
+        given-names: "Tom"
+      - family-names: "Lyakh"
+        given-names: "Dmitry"
+      - family-names: "Morino"
+        given-names: "Shinya"
+      - family-names: "Springer"
+        given-names: "Paul"
+      - family-names: "Stanwyck"
+        given-names: "Sam"
+      - family-names: "Terentyev"
+        given-names: "Igor"
+      - family-names: "Varadhan"
+        given-names: "Satya"
+      - family-names: "Wong"
+        given-names: "Jonathan"
+      - family-names: "Yamaguchi"
+        given-names: "Takuma"
+    collection-title: '2023 IEEE International Conference on Quantum Computing and Engineering (QCE)'
+    year: 2023
+    start: 1050
+    end: 1061
+    doi: '10.1109/QCE57702.2023.00119'
+    url: 'https://doi.org/10.1109/QCE57702.2023.00119'
