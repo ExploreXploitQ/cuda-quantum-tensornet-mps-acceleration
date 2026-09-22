@@ -171,24 +171,6 @@ bond dimension 16, and 1,000 finite shots on an NVIDIA L40S. Four consecutive
 optimizer evaluations took 14.31, 14.32, 14.28, and 14.28 seconds, for a mean of
 14.30 seconds.
 
-## Citation and library attribution
-
-When reporting results based on this implementation, cite CUDA-Q and the
-cuQuantum SDK, which provides the cuTensorNet library used by the native
-baseline and fallback. Application-level timings include circuit execution,
-library calls, and runtime overhead; they are not isolated cuTensorNet kernel
-timings.
-
-NVIDIA's [recommended cuQuantum citation](https://docs.nvidia.com/cuda/cuquantum/latest/python/overview.html#citing-cuquantum) is:
-
-> H. Bayraktar et al., “cuQuantum SDK: A High-Performance Library for Accelerating
-> Quantum Science,” *2023 IEEE International Conference on Quantum Computing and
-> Engineering (QCE)*, pp. 1050–1061, 2023.
-> DOI: [10.1109/QCE57702.2023.00119](https://doi.org/10.1109/QCE57702.2023.00119).
-
-The reference is available in [BibTeX](CITATION.bib) and in the `references`
-section of [CITATION.cff](CITATION.cff), alongside the existing CUDA-Q attribution.
-
 ## References
 
 - [NVIDIA cuQuantum SDK](https://developer.nvidia.com/cuquantum-sdk)
